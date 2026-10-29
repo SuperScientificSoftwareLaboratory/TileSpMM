@@ -3,6 +3,7 @@
 
 #include "mmio.h"
 #include "common.h"
+#include "utils.h"
 
 // void exclusive_scan(MAT_PTR_TYPE *input, int length)
 // {

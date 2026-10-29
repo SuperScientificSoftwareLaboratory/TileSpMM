@@ -2,6 +2,7 @@
 #define TILESPMM_CUDA_H
 
 #include "common.h"
+#include "utils.h"
 #include <mma.h>
 #include <cuda_runtime.h>
 #include <cuda_pipeline.h>

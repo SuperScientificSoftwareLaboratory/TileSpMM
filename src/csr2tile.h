@@ -1,4 +1,5 @@
 #include "common.h"
+#include "utils.h"
 #include "encode.h"
 #include "format.h"
 #include "tilespmm_cuda.h"
@@ -8,6 +9,9 @@
 #include "../lib/prefetch_fp16.h"
 #endif
 
+// =========================================================
+// Step 1: 统计每个行块的 Tile 数量及转换所需的临时空间
+// =========================================================
 void convert_step1(Tile_matrix *matrix, int rowA, int colA, MAT_PTR_TYPE nnzA,
                    MAT_PTR_TYPE *csrRowPtrA, int *csrColIdxA, MAT_VAL_TYPE *csrValA, 
                    int BM, int BN, char *flag_g, int *valid_cols_g,
@@ -205,7 +209,7 @@ void convert_step3(Tile_matrix *matrix, unsigned char *tile_csr_ptr,
                     }
                 }
             }
-            // 清理局部 flag
+            // 清理本次访问过的列标记
             for (int k = 0; k < valid_count; k++) {
                 flag[valid_cols[k]] = 0; 
             }
@@ -370,10 +374,12 @@ void convert_step3(Tile_matrix *matrix, unsigned char *tile_csr_ptr,
             }
         } 
     }
-    free(csr_colidx_temp_g); free(csr_val_temp_g);
+    free(csr_colidx_temp_g); 
+    free(csr_val_temp_g);
 }
 
 
+// 按切分阈值生成任务行号和片段起点，长行块标记为原子累加任务
 void tile_pretreatment(Tile_matrix *matrix, int *rowblkblock,
                        unsigned int **blkcoostylerowidx, int **blkcoostylerowidx_colstart, 
                        int prefetch_smem_th)
@@ -427,14 +433,10 @@ void tile_pretreatment(Tile_matrix *matrix, int *rowblkblock,
     }
 }
 
-typedef struct {
-    int TH;
-    float cost;
-} CostCand;
-
+// 根据行块长度分布和资源代价，筛选四个待实测的切分阈值
 void get_optimal_prefetch_th(int BM, int colB, int is_tf32, int tilem, int* tile_ptr, int* top4_T, const cudaDeviceProp& deviceProp)
 {
-    // Paper Section 3.3.1: device limits and compiled kernel resources.
+    // 根据设备上限和预编译核函数资源估计并发能力
     const int SM = prefetch_device_info.sm_count;
     const int TH_SM = prefetch_device_info.threads_per_sm;
     const size_t SMEM_SM = prefetch_device_info.shared_bytes_per_sm;
@@ -471,22 +473,27 @@ void get_optimal_prefetch_th(int BM, int colB, int is_tf32, int tilem, int* tile
         exit(EXIT_FAILURE);
     }
 
-    // Cap = B_sm * N_sm: estimated concurrent thread-block capacity.
+    // 并发容量：每个 SM 可驻留的线程块数乘以 SM 数量
     float cap = (float)(blk_sm * SM);
 
-    // Eq. (3): lambda_L2 = S_iter * Cap / S_L2.
+    // L2 拥堵权重：每次迭代访存量乘以并发容量，再除以 L2 容量
     int S_iter = kernel.iteration_bytes;
     float lambda_L2 = (float)(S_iter * cap) / (float)deviceProp.l2CacheSize;
 
-    // Eq. (4): calibrated atomic weight; retain the existing tuned values.
-    // These constants are not measured by prepare_prefetch.sh.
+    // 原子操作权重由已有平台数据校准，不由准备脚本测量
     float lambda_atom = 0.01f;
-    if (colB == 32 && (BM == 8 || BM == 16))
+    if (colB == 32)
     {
-        if (is_tf32) lambda_atom = (BM == 8) ? 0.007f : 0.008f;
-        else lambda_atom = (BM == 8) ? 0.004f : 0.009f;
+        if (BM == 64) lambda_atom = is_tf32 ? 0.020f : 0.019f;
+        else if (BM == 16) lambda_atom = is_tf32 ? 0.00830f : 0.00844f;
+        else lambda_atom = is_tf32 ? 0.00674f : 0.00360f;
     }
-    // Normalize colB by warp width 32, preserving the evaluation order.
+    else
+    {
+        if (BM == 16) lambda_atom = is_tf32 ? 0.01048f : 0.01163f;
+        else if (BM == 8) lambda_atom = is_tf32 ? 0.00960f : 0.00826f;
+    }
+    // 按 32 列归一化原子权重，保持原来的运算顺序
     float atom_per_col = lambda_atom * (1.0f / 32.0f);
 
     int max_len = 0;
@@ -509,7 +516,7 @@ void get_optimal_prefetch_th(int BM, int colB, int is_tf32, int tilem, int* tile
     int *hist = (int *)calloc(max_len + 1, sizeof(int));
     checkHostAlloc(hist, (max_len + 1) * (sizeof(int)), "hist");
 
-    // hist[L_i] groups identical row-tile fragment counts.
+    // 按行块的片段数量建立直方图
     int distinct_len = 0;
     for (int i = 0; i < tilem; i++)
     {
@@ -538,8 +545,7 @@ void get_optimal_prefetch_th(int BM, int colB, int is_tf32, int tilem, int* tile
     float avg_len = (float)total_len / tilem; 
     float atom_pen = atom_per_col * (float)colB; 
     
-    // Implementation extension: retain the existing long-tail protection.
-    // It scales the effective atomic weight; it is not a separate paper term.
+    // 保留长尾保护：极长行块出现时降低原子项权重
     if (max_len > avg_len * 5.0f) atom_pen *= 0.04f; 
 
     int Tmax = (max_len + T_MIN - 1) / T_MIN * T_MIN;
@@ -562,7 +568,7 @@ void get_optimal_prefetch_th(int BM, int colB, int is_tf32, int tilem, int* tile
             int cnt = hist[len];
             if (cnt == 0) continue;
 
-            // b_i = ceil(L_i / Thr); each task has up to ceil(L_i / b_i) fragments.
+            // 先确定任务数，再计算均匀切分后单个任务的最大片段数
             int blk = (len + TH - 1) / TH; 
             int blk_task = (len + blk - 1) / blk;
             atom_ops += (long long)(blk - 1) * cnt;
@@ -577,12 +583,11 @@ void get_optimal_prefetch_th(int BM, int colB, int is_tf32, int tilem, int* tile
             }
         }
 
-        // Retain the existing pruning of repeated fragment-group counts.
+        // 任务总数相同的后续阈值不再重复评估
         if (total_chunk == previous_total_chunk) continue;
         previous_total_chunk = total_chunk;
 
-        // Map sum(b_i) to launched blocks: pack four tasks for BM=8/16, colB=32;
-        // otherwise replicate the tasks over the 64-column output grid.
+        // 32 列的 8/16 行核函数每块打包四个任务，其余按输出列网格展开
         long long total_block = 0;
         if (colB == 32) 
         {
@@ -595,15 +600,14 @@ void get_optimal_prefetch_th(int BM, int colB, int is_tf32, int tilem, int* tile
             total_block = total_chunk * num_blk_x;
         }
 
-        float cost_base = (float)total_block / cap * TH;    // C_base = B_total / Cap * Thr
-        float cost_tail = (float)max_chunk;                // C_tail = max ceil(L_i / b_i)
+        float cost_base = (float)total_block / cap * TH;    // 吞吐代价
+        float cost_tail = (float)max_chunk;                // 尾部代价
         
-        float cost_l2 = l2_penalty * lambda_L2;            // C_L2 = sum(1 - 1 / b_i) * lambda_L2
+        float cost_l2 = l2_penalty * lambda_L2;            // L2 访存代价
 
-        // Eq. (1): Cost = C_base + C_tail + C_L2 + C_atom.
-        // Keep the original grouping: ((C_base + C_tail) + C_L2) + C_atom.
+        // 合并吞吐、尾部、L2 和原子代价，保持原来的浮点加法顺序
         float cost_comp = cost_base + cost_tail + cost_l2;
-        float cost_atom = atom_pen * atom_ops;            // C_atom = sum(b_i - 1) * effective weight * colB / 32
+        float cost_atom = atom_pen * atom_ops;            // 原子累加代价
         
         float cost = cost_comp + cost_atom;
         
@@ -612,8 +616,7 @@ void get_optimal_prefetch_th(int BM, int colB, int is_tf32, int tilem, int* tile
         cand_cnt++;
     }
     
-    // Paper Section 3.3.2: return the top four candidates for runtime testing.
-    // Preserve stable ordering for equal costs.
+    // 返回代价最小的四个候选；代价相同时保持原先顺序
     for (int i = 0; i < cand_cnt - 1; i++) 
     {
         for (int j = 0; j < cand_cnt - i - 1; j++) 
@@ -633,26 +636,11 @@ void get_optimal_prefetch_th(int BM, int colB, int is_tf32, int tilem, int* tile
         else top4_T[i] = cands[0].TH;
     }
 
-    // printf("BM=%2d, colB=%3d | max_len=%4d, avg_len=%.1f | Best Th=%3d (Cost=%.2f)\n",
-    //        BM, colB, max_len, avg_len, top4_T[0], cands[0].cost);
 
     free(active_len);
     free(hist);
 }
-typedef struct
-{
-    int TH;
-    int rowblkblock;
-    unsigned int *rows;
-    int *colstart;
-} Prefetch_schedule;
-
-typedef struct
-{
-    Prefetch_schedule entries[4];
-    size_t bytes;
-} Prefetch_cache;
-
+// 释放缓存中未被当前矩阵持有的调度，避免重复释放
 void free_prefetch_cache(Tile_matrix *mat, Prefetch_cache *cache)
 {
     for (int i = 0; i < 4; i++)
@@ -665,7 +653,8 @@ void free_prefetch_cache(Tile_matrix *mat, Prefetch_cache *cache)
     }
 }
 
-void update_pretreatment_and_memcpy(Tile_matrix *mat, int prefetch_smem_th,
+// 复用已缓存的调度；没有命中时构建，再上传到对应工作流
+void update_metadata(Tile_matrix *mat, int prefetch_smem_th,
                                     unsigned int *d_blkcoostylerowidx, 
                                     int *d_blkcoostylerowidx_colstart,
                                     cudaStream_t stream, Prefetch_cache *cache = NULL)
@@ -721,17 +710,7 @@ void update_pretreatment_and_memcpy(Tile_matrix *mat, int prefetch_smem_th,
     checkCuda(cudaMemcpyAsync(d_blkcoostylerowidx_colstart, blkcoostylerowidx_colstart, (rowblkblock + 1) * sizeof(int), cudaMemcpyHostToDevice, stream), "cudaMemcpyAsync d_blkcoostylerowidx_colstart");
 }
 
-typedef struct
-{
-    unsigned thread;
-    int colA;
-    char *flag;
-    int *valid_cols;
-    int *col_to_rank;
-    int *tile_count;
-    int tile_count_capacity;
-} Tile_workspace;
-
+// 释放三种行块转换共用的临时数组并清空工作区
 void free_tile_workspace(Tile_workspace *workspace)
 {
     free(workspace->flag);
@@ -741,6 +720,7 @@ void free_tile_workspace(Tile_workspace *workspace)
     memset(workspace, 0, sizeof(Tile_workspace));
 }
 
+// 依次统计、映射和排布，将一组子 CSR 转换为对应的 Tile 格式
 void Tile_create(Tile_matrix *matrix, 
                      int rowA, int colA, MAT_PTR_TYPE nnzA, int colB, 
                      MAT_PTR_TYPE *csrRowPtrA, int *csrColIdxA, MAT_VAL_TYPE *csrValA,
@@ -814,6 +794,35 @@ void Tile_create(Tile_matrix *matrix,
     free(tile_csr_ptr);
 }
 
+// 先热身 20 次，再每 50 次检查频率；达到稳定条件或次数上限后结束
+static void warmup_gpu(Tile_matrix *mat64, MAT_VAL_TYPE *d_Blockdense_Val_64, unsigned int *d_blkcoostylerowidx_64, int *d_blkcoostylerowidx_colstart_64, int *d_tile_colidx_64, cudaStream_t stream64,
+                       Tile_matrix *mat16, MAT_VAL_TYPE *d_Blockdense_Val_16, unsigned int *d_blkcoostylerowidx_16, int *d_blkcoostylerowidx_colstart_16, int *d_tile_colidx_16, cudaStream_t stream16,
+                       Tile_matrix *mat8, MAT_VAL_TYPE *d_Blockdense_Val_8, unsigned int *d_blkcoostylerowidx_8, int *d_blkcoostylerowidx_colstart_8, int *d_tile_colidx_8, cudaStream_t stream8,
+                       int colB, MAT_VAL_TYPE *d_b, MAT_ANS_TYPE *d_c, cudaEvent_t stop, int reference_khz)
+{
+    // 无法查询频率时，保持固定 100 次热身
+    int limit = reference_khz > 0 && get_gpu_clock() ? 1000 : 100;
+    unsigned int previous = 0;
+    for (int total = 0; total < limit;)
+    {
+        int count = total == 0 ? 20 : 50;
+        if (count > limit - total) count = limit - total;
+        for (int i = 0; i < count; i++)
+        {
+            if (mat64->tilenum > 0) switch_tilespmm_cuda_v64(mat64->rowblkblock, colB, d_Blockdense_Val_64, d_blkcoostylerowidx_64, d_blkcoostylerowidx_colstart_64, d_b, d_c, d_tile_colidx_64, stream64);
+            if (mat16->tilenum > 0) switch_tilespmm_cuda_v16(mat16->rowblkblock, colB, d_Blockdense_Val_16, d_blkcoostylerowidx_16, d_blkcoostylerowidx_colstart_16, d_b, d_c, d_tile_colidx_16, stream16);
+            if (mat8->tilenum > 0)  switch_tilespmm_cuda_v8(mat8->rowblkblock,  colB, d_Blockdense_Val_8,  d_blkcoostylerowidx_8,  d_blkcoostylerowidx_colstart_8,  d_b, d_c,  d_tile_colidx_8,  stream8);
+        }
+        checkCuda(cudaEventRecord(stop, cudaStreamLegacy), "cudaEventRecord");
+        checkCuda(cudaEventSynchronize(stop), "cudaEventSynchronize");
+        total += count;
+        unsigned int current = get_gpu_clock();
+        if (reference_khz > 0 && previous && current && previous * 1000.0 >= reference_khz * 0.95 && current * 1000.0 >= reference_khz * 0.95 && fabsf((float)current / previous - 1.0f) <= 0.02f) break;
+        previous = current;
+    }
+}
+
+// 上传 Tile 数据，实测选择调度阈值，再执行正式计时和结果回传
 void call_tilespmm_cuda(
                         Tile_matrix *mat64, int rowA_64, MAT_PTR_TYPE nnzA_64,
                         Tile_matrix *mat16, int rowA_16, MAT_PTR_TYPE nnzA_16,
@@ -941,17 +950,14 @@ void call_tilespmm_cuda(
     Prefetch_cache cache64 = {}, cache16 = {}, cache8 = {};
 
     // 热身开始
-    if (mat64->tilenum > 0) update_pretreatment_and_memcpy(mat64, best_th64, d_blkcoostylerowidx_64, d_blkcoostylerowidx_colstart_64, stream64, &cache64);
-    if (mat16->tilenum > 0) update_pretreatment_and_memcpy(mat16, best_th16, d_blkcoostylerowidx_16, d_blkcoostylerowidx_colstart_16, stream16, &cache16);
-    if (mat8->tilenum > 0)  update_pretreatment_and_memcpy(mat8,  best_th8,  d_blkcoostylerowidx_8,  d_blkcoostylerowidx_colstart_8,  stream8, &cache8);
+    if (mat64->tilenum > 0) update_metadata(mat64, best_th64, d_blkcoostylerowidx_64, d_blkcoostylerowidx_colstart_64, stream64, &cache64);
+    if (mat16->tilenum > 0) update_metadata(mat16, best_th16, d_blkcoostylerowidx_16, d_blkcoostylerowidx_colstart_16, stream16, &cache16);
+    if (mat8->tilenum > 0)  update_metadata(mat8,  best_th8,  d_blkcoostylerowidx_8,  d_blkcoostylerowidx_colstart_8,  stream8, &cache8);
 
-    for (int i = 0; i < WARMUP_NUM; i++)
-    {
-        if (mat64->tilenum > 0) switch_tilespmm_cuda_v64(mat64->rowblkblock, colB, d_Blockdense_Val_64, d_blkcoostylerowidx_64, d_blkcoostylerowidx_colstart_64, d_b, d_c, d_tile_colidx_64, stream64);
-        if (mat16->tilenum > 0) switch_tilespmm_cuda_v16(mat16->rowblkblock, colB, d_Blockdense_Val_16, d_blkcoostylerowidx_16, d_blkcoostylerowidx_colstart_16, d_b, d_c, d_tile_colidx_16, stream16);
-        if (mat8->tilenum > 0)  switch_tilespmm_cuda_v8(mat8->rowblkblock,  colB, d_Blockdense_Val_8,  d_blkcoostylerowidx_8,  d_blkcoostylerowidx_colstart_8,  d_b, d_c,  d_tile_colidx_8,  stream8);
-    }
-    checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+    warmup_gpu(mat64, d_Blockdense_Val_64, d_blkcoostylerowidx_64, d_blkcoostylerowidx_colstart_64, d_tile_colidx_64, stream64,
+               mat16, d_Blockdense_Val_16, d_blkcoostylerowidx_16, d_blkcoostylerowidx_colstart_16, d_tile_colidx_16, stream16,
+               mat8, d_Blockdense_Val_8, d_blkcoostylerowidx_8, d_blkcoostylerowidx_colstart_8, d_tile_colidx_8, stream8,
+               colB, d_b, d_c, stop, deviceProp.clockRate);
     // 热身结束
 
     
@@ -971,9 +977,9 @@ void call_tilespmm_cuda(
                     int cur_th16 = top4_16[j];
                     int cur_th8  = top4_8[k];
 
-                    if (mat64->tilenum > 0) update_pretreatment_and_memcpy(mat64, cur_th64, d_blkcoostylerowidx_64, d_blkcoostylerowidx_colstart_64, stream64, &cache64);
-                    if (mat16->tilenum > 0) update_pretreatment_and_memcpy(mat16, cur_th16, d_blkcoostylerowidx_16, d_blkcoostylerowidx_colstart_16, stream16, &cache16);
-                    if (mat8->tilenum > 0)  update_pretreatment_and_memcpy(mat8,  cur_th8,  d_blkcoostylerowidx_8,  d_blkcoostylerowidx_colstart_8,  stream8, &cache8);
+                    if (mat64->tilenum > 0) update_metadata(mat64, cur_th64, d_blkcoostylerowidx_64, d_blkcoostylerowidx_colstart_64, stream64, &cache64);
+                    if (mat16->tilenum > 0) update_metadata(mat16, cur_th16, d_blkcoostylerowidx_16, d_blkcoostylerowidx_colstart_16, stream16, &cache16);
+                    if (mat8->tilenum > 0)  update_metadata(mat8,  cur_th8,  d_blkcoostylerowidx_8,  d_blkcoostylerowidx_colstart_8,  stream8, &cache8);
 
                     for (int w = 0; w < 5; w++) 
                     {
@@ -1011,9 +1017,9 @@ void call_tilespmm_cuda(
     checkCuda(cudaEventSynchronize(stop_pre), "cudaEventSynchronize");
     float test_ms2;
     checkCuda(cudaEventElapsedTime(&test_ms2, start_pre, stop_pre), "cudaEventElapsedTime");
-    if (mat64->tilenum > 0) update_pretreatment_and_memcpy(mat64, best_th64, d_blkcoostylerowidx_64, d_blkcoostylerowidx_colstart_64, stream64, &cache64);
-    if (mat16->tilenum > 0) update_pretreatment_and_memcpy(mat16, best_th16, d_blkcoostylerowidx_16, d_blkcoostylerowidx_colstart_16, stream16, &cache16);
-    if (mat8->tilenum > 0)  update_pretreatment_and_memcpy(mat8,  best_th8,  d_blkcoostylerowidx_8,  d_blkcoostylerowidx_colstart_8,  stream8, &cache8);
+    if (mat64->tilenum > 0) update_metadata(mat64, best_th64, d_blkcoostylerowidx_64, d_blkcoostylerowidx_colstart_64, stream64, &cache64);
+    if (mat16->tilenum > 0) update_metadata(mat16, best_th16, d_blkcoostylerowidx_16, d_blkcoostylerowidx_colstart_16, stream16, &cache16);
+    if (mat8->tilenum > 0)  update_metadata(mat8,  best_th8,  d_blkcoostylerowidx_8,  d_blkcoostylerowidx_colstart_8,  stream8, &cache8);
 
     checkCuda(cudaMemset(d_c, 0, (size_t)row_padding * (size_t)colB * sizeof(MAT_ANS_TYPE)), "cudaMemset d_c");
     if (mat64->tilenum > 0) switch_tilespmm_cuda_v64(mat64->rowblkblock, colB, d_Blockdense_Val_64, d_blkcoostylerowidx_64, d_blkcoostylerowidx_colstart_64, d_b, d_c, d_tile_colidx_64, stream64);
@@ -1024,6 +1030,15 @@ void call_tilespmm_cuda(
     {
         checkCuda(cudaMemcpy(raw_c, d_c, (size_t)rowA * (size_t)colB * sizeof(MAT_ANS_TYPE), cudaMemcpyDeviceToHost), "copy TileSpMM result");
     }
+
+    warmup_gpu(mat64, d_Blockdense_Val_64, d_blkcoostylerowidx_64, d_blkcoostylerowidx_colstart_64, d_tile_colidx_64, stream64,
+               mat16, d_Blockdense_Val_16, d_blkcoostylerowidx_16, d_blkcoostylerowidx_colstart_16, d_tile_colidx_16, stream16,
+               mat8, d_Blockdense_Val_8, d_blkcoostylerowidx_8, d_blkcoostylerowidx_colstart_8, d_tile_colidx_8, stream8,
+               colB, d_b, d_c, stop, deviceProp.clockRate);
+    checkCuda(cudaMemset(d_c, 0, (size_t)row_padding * (size_t)colB * sizeof(MAT_ANS_TYPE)), "cudaMemset d_c");
+    if (mat64->tilenum > 0) switch_tilespmm_cuda_v64(mat64->rowblkblock, colB, d_Blockdense_Val_64, d_blkcoostylerowidx_64, d_blkcoostylerowidx_colstart_64, d_b, d_c, d_tile_colidx_64, stream64);
+    if (mat16->tilenum > 0) switch_tilespmm_cuda_v16(mat16->rowblkblock, colB, d_Blockdense_Val_16, d_blkcoostylerowidx_16, d_blkcoostylerowidx_colstart_16, d_b, d_c, d_tile_colidx_16, stream16);
+    if (mat8->tilenum > 0)  switch_tilespmm_cuda_v8(mat8->rowblkblock,  colB, d_Blockdense_Val_8,  d_blkcoostylerowidx_8,  d_blkcoostylerowidx_colstart_8,  d_b, d_c,  d_tile_colidx_8,  stream8);
 
     checkCuda(cudaEventRecord(start, cudaStreamLegacy), "cudaEventRecord");
     for (int i = 0; i < BENCH_REPEAT; i++)
@@ -1042,7 +1057,7 @@ void call_tilespmm_cuda(
     double Tflops = (2 * (double)total_nnzA * 1.0e-6 / time_cuda_spmm_base * logical_colB) / 1000;
     printf("  TileSpMM runtime %4.3f ms, %4.3f TFlops\n", time_cuda_spmm_base, Tflops);
 
-    // Preserve the original three preprocessing intervals, all in milliseconds.
+    // 预处理时间仍为原来的三段计时之和，单位为毫秒
     double pre_time_ms = cpu_pre_time_ms + (double)test_ms1 + (double)test_ms2;
     fprintf(fout, "%d,%d,%d,%.9g,%.9g,%.9g,", best_th64, best_th16, best_th8, pre_time_ms, time_cuda_spmm_base, Tflops);
     fflush(fout);
@@ -1075,5 +1090,4 @@ void call_tilespmm_cuda(
     checkCuda(cudaEventDestroy(stop), "cudaEventDestroy");
     checkCuda(cudaEventDestroy(start_pre), "cudaEventDestroy");
     checkCuda(cudaEventDestroy(stop_pre), "cudaEventDestroy");
-
 }

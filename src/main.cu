@@ -46,22 +46,22 @@ void cusparse_spmm_all(int m, int k, int nnzA,
     gettimeofday(&t1, NULL);
 
     cusparseHandle_t handle;
-    checkCusparse(cusparseCreate(&handle), "create handle");
-    checkCusparse(cusparseSetStream(handle, cudaStreamLegacy), "set legacy stream");
+    cusparseCreate(&handle);
+    cusparseSetStream(handle, cudaStreamLegacy);
 
     cusparseSpMatDescr_t matA;
     cusparseDnMatDescr_t matB, matC;
 #ifdef TFLOAT
-    checkCusparse(cusparseCreateCsr(&matA, m, k, nnzA, d_csrRowPtrA, d_csrColIdxA, d_csrValA, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F), "create CSR A (Float)");
+    cusparseCreateCsr(&matA, m, k, nnzA, d_csrRowPtrA, d_csrColIdxA, d_csrValA, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F);
 
-    checkCusparse(cusparseCreateDnMat(&matB, k, n, ldb, d_B, CUDA_R_32F, CUSPARSE_ORDER_ROW), "create Dense B (Float)");
+    cusparseCreateDnMat(&matB, k, n, ldb, d_B, CUDA_R_32F, CUSPARSE_ORDER_ROW);
 #else
-    checkCusparse(cusparseCreateCsr(&matA, m, k, nnzA, d_csrRowPtrA, d_csrColIdxA, d_csrValA, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_16F), "create CSR A (Half)");
+    cusparseCreateCsr(&matA, m, k, nnzA, d_csrRowPtrA, d_csrColIdxA, d_csrValA, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_16F);
 
-    checkCusparse(cusparseCreateDnMat(&matB, k, n, ldb, d_B, CUDA_R_16F, CUSPARSE_ORDER_ROW), "create Dense B (Half)");
+    cusparseCreateDnMat(&matB, k, n, ldb, d_B, CUDA_R_16F, CUSPARSE_ORDER_ROW);
 
 #endif
-    checkCusparse(cusparseCreateDnMat(&matC, m, n, n, d_C, CUDA_R_32F, CUSPARSE_ORDER_ROW), "create Dense C (Float)");
+    cusparseCreateDnMat(&matC, m, n, n, d_C, CUDA_R_32F, CUSPARSE_ORDER_ROW);
 
 
     float alpha = 1.0f;
@@ -72,7 +72,7 @@ void cusparse_spmm_all(int m, int k, int nnzA,
     size_t bufferSize = 0;
     void *dBuffer = NULL;
     
-    checkCusparse(cusparseSpMM_bufferSize(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, matA, matB, &beta, matC, computeType, CUSPARSE_SPMM_ALG_DEFAULT, &bufferSize), "spmm buffer size");
+    cusparseSpMM_bufferSize(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, matA, matB, &beta, matC, computeType, CUSPARSE_SPMM_ALG_DEFAULT, &bufferSize);
     
     checkCuda(cudaMalloc(&dBuffer, bufferSize), "malloc buffer");
     gettimeofday(&t2, NULL);
@@ -83,7 +83,7 @@ void cusparse_spmm_all(int m, int k, int nnzA,
     fflush(fout);
 
     for(int i=0; i<WARMUP_NUM; i++) {
-        checkCusparse(cusparseSpMM(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, matA, matB, &beta, matC, computeType, CUSPARSE_SPMM_ALG_DEFAULT, dBuffer), "execute cuSPARSE SpMM");
+        cusparseSpMM(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, matA, matB, &beta, matC, computeType, CUSPARSE_SPMM_ALG_DEFAULT, dBuffer);
     }
     checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
 
@@ -94,7 +94,7 @@ void cusparse_spmm_all(int m, int k, int nnzA,
     checkCuda(cudaEventRecord(start, cudaStreamLegacy), "cudaEventRecord");
 
     for(int i=0; i<BENCH_REPEAT; i++) {
-        checkCusparse(cusparseSpMM(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, matA, matB, &beta, matC, computeType, CUSPARSE_SPMM_ALG_DEFAULT, dBuffer), "execute cuSPARSE SpMM");
+        cusparseSpMM(handle, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, matA, matB, &beta, matC, computeType, CUSPARSE_SPMM_ALG_DEFAULT, dBuffer);
     }
 
     checkCuda(cudaEventRecord(stop, cudaStreamLegacy), "cudaEventRecord");
@@ -120,10 +120,10 @@ void cusparse_spmm_all(int m, int k, int nnzA,
     if (h_C != NULL)
         checkCuda(cudaMemcpy(h_C, d_C, sizeC_padded, cudaMemcpyDeviceToHost), "copy cuSPARSE result");
 
-    checkCusparse(cusparseDestroyDnMat(matB), "destroy matB");
-    checkCusparse(cusparseDestroyDnMat(matC), "destroy matC");
-    checkCusparse(cusparseDestroySpMat(matA), "destroy matA");
-    checkCusparse(cusparseDestroy(handle), "destroy handle");
+    cusparseDestroyDnMat(matB);
+    cusparseDestroyDnMat(matC);
+    cusparseDestroySpMat(matA);
+    cusparseDestroy(handle);
     checkCuda(cudaFree(dBuffer), "free buffer");
     checkCuda(cudaFree(d_csrRowPtrA), "free d_A_ptr");
     checkCuda(cudaFree(d_csrColIdxA), "free d_A_idx");
@@ -226,7 +226,7 @@ int main(int argc, char **argv)
     gettimeofday(&t1, NULL);
     double ml_features[TILESPMM_ML_FEATURE_COUNT];
     double capability = deviceProp.major + deviceProp.minor / 10.0;
-    if (!tilespmm_model_features_from_csr(
+    if (!features_from_csr(
             rowA, colA, nnzA, csrRowPtrA, capability, colB, ml_features))
     {
         fprintf(stderr, "Cannot extract model features from the input CSR matrix.\n");
@@ -337,6 +337,8 @@ int main(int argc, char **argv)
     free(matrixC);
     free(matrixC_cusparse);
 
+    Tile_destroy(mat64); Tile_destroy(mat16); Tile_destroy(mat8);
+    free(mat64->orig_tile_row_idx); free(mat16->orig_tile_row_idx); free(mat8->orig_tile_row_idx);
     free(mat64); free(mat16); free(mat8);
     if(ptr_64) free(ptr_64); if(idx_64) free(idx_64); if(val_64) free(val_64); if(orig_64) free(orig_64);
     if(ptr_16) free(ptr_16); if(idx_16) free(idx_16); if(val_16) free(val_16); if(orig_16) free(orig_16);

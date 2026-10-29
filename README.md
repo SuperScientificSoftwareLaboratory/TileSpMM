@@ -63,7 +63,7 @@ The main files in `src/` are organized as follows:
 - `tilespmm_cuda.h`, `utils.h`: FP16/TF32 CUDA kernels, GPU instruction helpers, and utility functions.
 - `model.h`, `ml_predict.c`, `ml_predict.h`, `model_features.h`: Trained threshold prediction models, inference interfaces, and input feature construction.
 - `mmio.h`, `mmio_highlevel.h`: Matrix Market file loading.
-- `common.h`, `format.h`, `error_check.h`: Shared definitions, tile data structures, and error checks.
+- `common.h`, `format.h`: Shared definitions, tile data structures, and error checks.
 
 ## Execution
 

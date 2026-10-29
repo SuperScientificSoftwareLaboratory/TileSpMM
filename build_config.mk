@@ -9,10 +9,8 @@ INC = -Isrc -I$(CUDA_INSTALL_PATH)/include
 # Retain the verified CUDA 12.8 / host compiler compatibility option.
 NVCC_FLAGS = -U_GNU_SOURCE -O3 -w -m64 -gencode arch=compute_$(CUDA_ARCH),code=sm_$(CUDA_ARCH) -Xptxas -v
 OPTIONS = -Xcompiler -fopenmp -O3
-CUDA_LIBS = -L$(CUDA_INSTALL_PATH)/lib64 -lcublas -lcusparse -Xlinker -rpath=$(CUDA_INSTALL_PATH)/lib64
+CUDA_LIBS = -ldl -L$(CUDA_INSTALL_PATH)/lib64 -lcublas -lcusparse -Xlinker -rpath=$(CUDA_INSTALL_PATH)/lib64
 
-# Benchmark counts apply to BOTH precisions and cuSPARSE.
+# CHECK applies to BOTH precisions.
 CHECK ?= 1
-WARMUP_NUM ?= 100
-BENCH_REPEAT ?= 1000
-EXPERIMENT_FLAGS = -DCHECK=$(CHECK) -DWARMUP_NUM=$(WARMUP_NUM) -DBENCH_REPEAT=$(BENCH_REPEAT)
+EXPERIMENT_FLAGS = -DCHECK=$(CHECK)

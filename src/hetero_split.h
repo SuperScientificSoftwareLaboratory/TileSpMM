@@ -5,6 +5,7 @@
 
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 
+// 统计行区间内的不同列数，只清理本次访问过的标记
 int count_cols(int start, int end, MAT_PTR_TYPE *csrRowPtrA, int *csrColIdxA, char *flag, int *touched) 
 {
     int unique_count = 0;
@@ -81,6 +82,7 @@ int count_cols_cached(int start, int end, MAT_PTR_TYPE *csrRowPtrA, int *csrColI
     return count_cols(start, end, csrRowPtrA, csrColIdxA, flag, touched);
 }
 
+// 按分组中的原始行顺序生成子 CSR，并保留行号映射
 void build_sub_csr(int *group, int group_size, MAT_PTR_TYPE *csrRowPtrA, int *csrColIdxA, MAT_VAL_TYPE *csrValA,
                 int *rowA_sub, MAT_PTR_TYPE *nnzA_sub, MAT_PTR_TYPE **ptr_sub, int **idx_sub, MAT_VAL_TYPE **val_sub, int **orig_row_sub) 
 {
@@ -138,6 +140,7 @@ void build_sub_csr(int *group, int group_size, MAT_PTR_TYPE *csrRowPtrA, int *cs
     }
 }
 
+// 按列复用情况和 gamma、delta 阈值依次选择 64、16、8 行分组
 void matrix_split(int rowA, int colA, MAT_PTR_TYPE nnzA,
                 MAT_PTR_TYPE *csrRowPtrA, int *csrColIdxA, MAT_VAL_TYPE *csrValA,
                 float gamma, float delta,
@@ -275,10 +278,6 @@ void matrix_split(int rowA, int colA, MAT_PTR_TYPE nnzA,
 
     free(count_cache);
 
-    // printf("\n[AdaTile-SpMM Inspector] Partitioning Complete:\n");
-    // printf("  -> Tile-64: %d rows (%.2f%%)\n", count_64, (float)count_64/rowA * 100);
-    // printf("  -> Tile-16: %d rows (%.2f%%)\n", count_16, (float)count_16/rowA * 100);
-    // printf("  -> Tile-8 : %d rows (%.2f%%)\n\n", count_8,  (float)count_8/rowA * 100);
 
     build_sub_csr(group_64, count_64, csrRowPtrA, csrColIdxA, csrValA, rowA_64, nnzA_64, ptr_64, idx_64, val_64, orig_row_64);
     build_sub_csr(group_16, count_16, csrRowPtrA, csrColIdxA, csrValA, rowA_16, nnzA_16, ptr_16, idx_16, val_16, orig_row_16);

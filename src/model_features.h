@@ -5,11 +5,8 @@
 #include <math.h>
 #include "ml_predict.h"
 
-/* Use the original CSR dimensions and nnz, including symmetry expansion.
- * Empty rows participate in min_row_nnz. colB is the logical dense width.
- */
-static inline int tilespmm_model_features_from_stats(
-    int rows, int cols, long long nnz, int max_row_nnz, int min_row_nnz,
+// 使用对称展开后的原始 CSR 统计；空行参与最小值计算，colB 为实际列宽
+static inline int features_from_stats(int rows, int cols, long long nnz, int max_row_nnz, int min_row_nnz,
     double capability, int colB, double *features)
 {
     if (!features || rows <= 0 || cols <= 0 || nnz < 0 ||
@@ -31,10 +28,8 @@ static inline int tilespmm_model_features_from_stats(
     return 1;
 }
 
-#ifdef __cplusplus
 template <typename Pointer>
-static inline int tilespmm_model_features_from_csr(
-    int rows, int cols, long long nnz, const Pointer *row_ptr,
+static inline int features_from_csr(int rows, int cols, long long nnz, const Pointer *row_ptr,
     double capability, int colB, double *features)
 {
     if (!row_ptr || rows <= 0 || row_ptr[0] != 0 ||
@@ -57,9 +52,8 @@ static inline int tilespmm_model_features_from_csr(
     if (invalid)
         return 0;
 
-    return tilespmm_model_features_from_stats(
+    return features_from_stats(
         rows, cols, nnz, max_nnz, min_nnz, capability, colB, features);
 }
-#endif
 
 #endif

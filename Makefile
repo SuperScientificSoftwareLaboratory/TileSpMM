@@ -7,7 +7,7 @@ MODEL_SO = $(LIB_DIR)/model.so
 ML_LIBS = -L./$(LIB_DIR) -l:model.so -Xlinker -rpath -Xlinker '$$ORIGIN/../$(LIB_DIR)'
 LIBS = $(CUDA_LIBS) $(ML_LIBS)
 
-.PHONY: all fp16 tf32 nfp16 ntf32 check-platform clean
+.PHONY: all fp16 tf32 check-platform clean
 all: fp16 tf32
 
 $(BIN_DIR):

@@ -10,7 +10,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
-#include "error_check.h"
+#include "common.h"
 
 #ifndef MM_IO_H
 #define MM_IO_H

@@ -291,9 +291,7 @@ template <int N>
 __device__ __forceinline__
 void cp_async_wait_group()
 {
-    asm volatile(
-        "cp.async.wait_group %0;\n"
-        :: "n"(N));
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
 }
 
 __device__ __forceinline__
